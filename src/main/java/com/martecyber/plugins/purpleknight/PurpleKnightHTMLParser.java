@@ -1,117 +1,155 @@
 package com.martecyber.plugins.purpleknight;
 
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.martecyber.ares.imports.ImportParser;
 import com.martecyber.ares.imports.ParseResult;
-import com.martecyber.ares.imports.ParsedDetection;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Parser for PurpleKnight HTML report.
- * Extracts failed indicators from the AD assessment report.
+ * Parser for PurpleKnight's single-file HTML report. The page is a bundled web app, not a
+ * table: every indicator's result is embedded as JSON in an inline script, one assignment per
+ * indicator ({@code window["Category_1"]["<uuid>"] = {...};}), next to a {@code
+ * window.reportJSON} summary holding the forest name. Both are read as JSON — nothing here
+ * depends on the report's visual layout.
  */
 @Component
 public class PurpleKnightHTMLParser implements ImportParser {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    // Match indicator rows: look for patterns with risk/severity text
-    private static final Pattern INDICATOR_BLOCK = Pattern.compile(
-        "<tr[^>]*>.*?</tr>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
-    private static final Pattern TD_PATTERN = Pattern.compile(
-        "<td[^>]*>(.*?)</td>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
-    private static final Pattern HTML_TAG = Pattern.compile("<[^>]+>");
-    private static final Pattern SEVERITY_SECTION = Pattern.compile(
-        "(?:Tier\\s*[0-3]|Critical|High|Medium|Low)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern INDICATOR_ASSIGNMENT =
+        Pattern.compile("window\\[\"Category_\\d+\"\\]\\[\"[0-9a-fA-F-]{36}\"\\]\\s*=\\s*");
+    private static final String REPORT_JSON = "window.reportJSON";
 
     @Override public String getToolId() { return "purpleknight"; }
     @Override public String getFormatId() { return "html"; }
-    @Override public String getDisplayName() { return "PurpleKnight HTML"; }
+    @Override public String getDisplayName() { return "PurpleKnight HTML report"; }
     @Override public String[] getSupportedExtensions() { return new String[]{".html", ".htm"}; }
 
     @Override
     public boolean validate(byte[] content) {
-        String s = new String(content, StandardCharsets.UTF_8).toLowerCase();
-        return s.contains("purpleknight") || (s.contains("active directory") && s.contains("indicator"));
+        String s = new String(content, StandardCharsets.UTF_8);
+        return s.contains(REPORT_JSON) && INDICATOR_ASSIGNMENT.matcher(s).find();
     }
 
     @Override
     public ParseResult parse(byte[] content) throws Exception {
         ParseResult result = new ParseResult();
-        String html = new String(content, StandardCharsets.UTF_8);
+        char[] text = new String(content, StandardCharsets.UTF_8).toCharArray();
+        String html = new String(text);
 
-        // Extract table rows
-        Matcher rowMatcher = INDICATOR_BLOCK.matcher(html);
-        while (rowMatcher.find()) {
-            String row = rowMatcher.group();
-            List<String> cells = extractCells(row);
-            if (cells.size() < 2) continue;
+        JsonNode summary = readSummary(text, html);
+        String forest = readForest(summary, html);
+        Map<Integer, String> categories = readCategories(summary);
+        int notRun = 0;
+        Matcher m = INDICATOR_ASSIGNMENT.matcher(html);
+        while (m.find()) {
+            JsonNode node = readJsonAt(text, m.end());
+            if (node == null) { result.addWarning("Skipped an indicator block that is not valid JSON."); continue; }
+            JsonNode ri = node.path("ResIndicator");
+            JsonNode exec = node.path("ExecutionResult");
 
-            // Try to identify rows that look like indicator data
-            // Common PK format: [Category] [Indicator Name] [Status] [Severity]
-            String possibleStatus = cells.stream()
-                .filter(c -> c.equalsIgnoreCase("fail") || c.equalsIgnoreCase("failed") ||
-                             c.equalsIgnoreCase("at risk") || c.equalsIgnoreCase("exposed"))
-                .findFirst().orElse(null);
+            if (ri.path("IsFailedToRun").asBoolean(false)) { notRun++; continue; }
+            // ExposureType is "IOE"/"IOC" only for indicators that found something.
+            String exposure = ri.path("ExposureType").asText("None");
+            if (!"IOE".equalsIgnoreCase(exposure) && !"IOC".equalsIgnoreCase(exposure)) continue;
 
-            if (possibleStatus == null) continue; // Only failed indicators
+            List<String> objects = new ArrayList<>();
+            for (JsonNode obj : node.path("IndicatorReportObjects")) objects.add(describeObject(obj));
 
-            String name = findName(cells);
-            if (name == null || name.length() < 5) continue;
+            Map<String, List<String>> frameworks = new LinkedHashMap<>();
+            for (JsonNode fw : ri.path("SecurityFrameworks")) {
+                List<String> tags = new ArrayList<>();
+                fw.path("Tags").forEach(t -> tags.add(t.asText()));
+                if (!tags.isEmpty()) frameworks.put(fw.path("Name").asText(), tags);
+            }
 
-            String severity = cells.stream()
-                .filter(c -> SEVERITY_SECTION.matcher(c).matches())
-                .findFirst().map(this::mapSeverity).orElse("medium");
-
-            String templateId = "pk-" + name.toLowerCase().replaceAll("[^a-z0-9]+", "-");
-            if (templateId.length() > 200) templateId = templateId.substring(0, 200);
-
-            String raw;
-            try { raw = MAPPER.writeValueAsString(Map.of("cells", cells)); }
-            catch (Exception e) { raw = "{}"; }
-
-            result.addDetection(new ParsedDetection(name, severity,
-                "Status: " + possibleStatus, null, templateId, raw));
+            result.addDetection(PurpleKnightSupport.toDetection(new PurpleKnightSupport.Indicator(
+                text(ri, "ShortName"), text(ri, "Name"), text(ri, "Severity"), exposure,
+                categories.get(ri.path("CategoryID").asInt(0)), text(exec, "Score"), text(ri, "Grade"),
+                PurpleKnightSupport.htmlToMarkdown(text(ri, "Description")),
+                PurpleKnightSupport.htmlToMarkdown(text(ri, "LikelihoodOfCompromise")),
+                text(exec, "ResultMessage"),
+                PurpleKnightSupport.htmlToMarkdown(text(exec, "Remediation")),
+                frameworks, objects, node.path("TotalResultsCount").asInt(objects.size())), forest));
         }
 
+        if (notRun > 0) result.addWarning(notRun + " indicator(s) failed to run in PurpleKnight and were skipped.");
         if (result.getDetections().isEmpty()) {
-            result.addWarning("No failed indicators found. Verify the HTML report format.");
+            result.addWarning("No indicators of exposure/compromise found in this report.");
+        } else {
+            PurpleKnightSupport.addDirectory(result, forest);
         }
-
         return result;
     }
 
-    private List<String> extractCells(String row) {
-        List<String> cells = new ArrayList<>();
-        Matcher m = TD_PATTERN.matcher(row);
-        while (m.find()) {
-            String text = HTML_TAG.matcher(m.group(1)).replaceAll("").trim();
-            if (!text.isEmpty()) cells.add(text);
+    /** The {@code window.reportJSON} summary object, or null if absent/unreadable. */
+    private static JsonNode readSummary(char[] text, String html) {
+        int at = html.indexOf(REPORT_JSON);
+        int brace = at >= 0 ? html.indexOf('{', at) : -1;
+        return brace >= 0 ? readJsonAt(text, brace) : null;
+    }
+
+    private static String readForest(JsonNode summary, String html) {
+        if (summary != null) {
+            String forest = summary.path("reportResultsList").path(0).path("ForestName").asText(null);
+            if (forest != null && !forest.isBlank()) return forest;
+            String fromName = PurpleKnightSupport.forestFromReportName(summary.path("ReportName").asText(null));
+            if (fromName != null) return fromName;
         }
-        return cells;
+        return PurpleKnightSupport.forestFromReportName(html.length() > 20_000 ? html.substring(0, 20_000) : html);
     }
 
-    private String findName(List<String> cells) {
-        // The name is typically the longest cell that is not a status or severity word
-        return cells.stream()
-            .filter(c -> c.length() > 10 && !SEVERITY_SECTION.matcher(c).matches()
-                && !c.equalsIgnoreCase("fail") && !c.equalsIgnoreCase("failed")
-                && !c.equalsIgnoreCase("pass") && !c.equalsIgnoreCase("at risk"))
-            .max(Comparator.comparingInt(String::length))
-            .orElse(null);
+    /** Category id -> name, from the report's own {@code GeneralConfig.Categories}. */
+    private static Map<Integer, String> readCategories(JsonNode summary) {
+        Map<Integer, String> names = new LinkedHashMap<>();
+        if (summary != null) {
+            for (JsonNode c : summary.path("GeneralConfig").path("Categories")) {
+                names.put(c.path("ID").asInt(), c.path("Name").asText());
+            }
+        }
+        return names;
     }
 
-    private String mapSeverity(String s) {
-        if (s == null) return "medium";
-        String lower = s.toLowerCase();
-        if (lower.contains("critical") || lower.contains("tier 0")) return "critical";
-        if (lower.contains("high") || lower.contains("tier 1")) return "high";
-        if (lower.contains("medium") || lower.contains("tier 2")) return "medium";
-        if (lower.contains("low") || lower.contains("tier 3")) return "low";
-        return "medium";
+    /** Reads exactly one JSON value starting at {@code offset} and ignores whatever follows
+     *  (the trailing {@code ;} and the next assignment) — without copying the 4 MB page. */
+    private static JsonNode readJsonAt(char[] text, int offset) {
+        try (JsonParser p = MAPPER.getFactory().createParser(text, offset, text.length - offset)) {
+            return MAPPER.readTree(p);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** One affected object arrives as a list of {@code "Key: value"} strings (or, defensively,
+     *  a plain string / object) — rendered on one line. */
+    private static String describeObject(JsonNode obj) {
+        if (obj.isArray()) {
+            List<String> parts = new ArrayList<>();
+            obj.forEach(v -> { if (!"Ignored: False".equals(v.asText())) parts.add(v.asText()); });
+            return String.join(" | ", parts);
+        }
+        if (obj.isObject()) {
+            List<String> parts = new ArrayList<>();
+            obj.fields().forEachRemaining(e -> parts.add(e.getKey() + ": " + e.getValue().asText()));
+            return String.join(" | ", parts);
+        }
+        return obj.asText();
+    }
+
+    private static String text(JsonNode n, String field) {
+        JsonNode v = n.path(field);
+        if (v.isMissingNode() || v.isNull()) return null;
+        String s = v.asText();
+        return s.isBlank() ? null : s;
     }
 }
